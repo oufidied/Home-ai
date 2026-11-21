@@ -198,7 +198,8 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
   };
 
   const DEFAULT_SYSTEM = "You are Arthur's personal AI assistant running on his own PC. Be clear, direct and concise.";
-  let settings = Object.assign({ url: "", token: "", model: "", system: DEFAULT_SYSTEM }, store.get("settings", {}));
+  let settings = Object.assign({ url: "https://arthur-pc.taild9cfe3.ts.net", token: "", model: "", system: DEFAULT_SYSTEM }, store.get("settings", {}));
+  if (!settings.url) settings.url = "https://arthur-pc.taild9cfe3.ts.net";
   let chats = store.get("chats", []);
   let currentId = store.get("currentId", null);
   let models = [];
@@ -272,7 +273,7 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
   }
 
   async function probe(timeoutMs = 6000) {
-    if (!base()) return { state: "setup", text: "Tap to set up" };
+    if (!base()) return { state: "setup", text: "Enter your PC address first" };
     const ac = new AbortController();
     const t = setTimeout(() => ac.abort(), timeoutMs);
     try {
@@ -553,7 +554,7 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
   }
   const closeSettings = () => els.sheet.classList.remove("open");
   function readForm() {
-    let url = $("#sUrl").value.trim();
+    let url = $("#sUrl").value.trim() || $("#sUrl").placeholder;
     if (url && !/^https?:\/\//i.test(url)) url = "https://" + url;
     return { url, token: $("#sToken").value.trim(), model: $("#sModel").value, system: $("#sSystem").value };
   }
