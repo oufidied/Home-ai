@@ -141,9 +141,14 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
 .switch input{width:22px;height:22px;accent-color:var(--accent)}
 
 .model-list{display:flex;flex-direction:column;gap:6px}
-.model{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:var(--bg);border:1px solid var(--line);border-radius:14px;padding:12px;color:var(--text)}
+.model{display:flex;align-items:center;gap:8px;width:100%;background:var(--bg);border:1px solid var(--line);border-radius:14px;padding:0 10px 0 0;color:var(--text)}
 .model.sel{border-color:var(--accent);background:rgba(124,108,255,.1)}
+.model .pick{flex:1;min-width:0;display:flex;align-items:center;gap:8px;text-align:left;background:none;border:0;color:var(--text);padding:12px 0 12px 10px}
+.model .act{flex:none;border:1px solid var(--line);background:var(--panel2);color:var(--muted);border-radius:10px;padding:7px 12px;font-size:13px}
+.model .act.load{color:#fff;border:0;background:linear-gradient(135deg,var(--accent),var(--accent2))}
+.model .act:disabled{opacity:.5}
 .model .mn{flex:1;min-width:0}
+.model .mn .badges{margin-top:5px}
 .model .mn b{display:block;font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .model .mn small{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
 .badges{display:flex;gap:4px;flex:none}
@@ -153,7 +158,7 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
 .model .tick{width:20px;color:var(--accent);flex:none;text-align:center}
 .model-note{font-size:12px;color:var(--muted);margin-top:12px;line-height:1.45}
 
-#toast{position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 90px);transform:translate(-50%,20px);background:var(--panel2);border:1px solid var(--line);
+#toast{position:fixed;left:50%;top:calc(env(safe-area-inset-top) + 64px);transform:translate(-50%,-20px);background:var(--panel2);border:1px solid var(--line);
   color:var(--text);padding:10px 14px;border-radius:14px;font-size:14px;max-width:88vw;text-align:center;opacity:0;pointer-events:none;transition:.25s;z-index:30}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 </style>
@@ -214,7 +219,7 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
     <h3><span>Models</span><button class="btn small" id="refreshModels">Refresh</button>
       <button class="icon-btn" data-close aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></h3>
     <div class="model-list" id="modelList"></div>
-    <div class="model-note">Models marked <b>Loaded</b> answer straight away. Others load when you send your first message, which can take a minute for big ones. <b>Vision</b> models can see images.</div>
+    <div class="model-note">Tap a model to use it. <b>Load</b> loads it on your PC now (and unloads the others to free memory); otherwise it loads when you send your first message. <b>Vision</b> models can see images.</div>
   </div>
 </div>
 
@@ -279,6 +284,8 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
   let currentId = ls.get("currentId", null);
   let models = [];          // [{id, type, loaded, vision}]
   let modelsDetailed = false;
+  let canManage = false;    // LM Studio supports load/unload over the API
+  let busyModel = null;     // model currently being loaded/unloaded from the app
   let controller = null;
   let status = "checking";
   let pending = [];         // images attached to the next message (data URLs)
@@ -365,12 +372,31 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
   async function probe(timeoutMs = 6000) {
     if (!base()) return { state: "setup", text: "Enter your PC address first" };
     try {
-      // LM Studio's own API gives loaded state + vision info
-      let res = await timedFetch(base() + "/api/v0/models", timeoutMs);
+      // LM Studio's REST API v1: full info (loaded instances, vision, size)
+      let res = await timedFetch(base() + "/api/v1/models", timeoutMs);
+      if (res.status === 401 || res.status === 403) return { state: "error", text: "Token rejected" };
+      if (res.status === 502 || res.status === 503) return { state: "error", text: "LM Studio server off" };
+      if (res.ok) {
+        const j = await res.json();
+        if (Array.isArray(j.models)) {
+          models = j.models.filter(m => m.type === "llm").map(m => ({
+            id: m.key, name: m.display_name || m.key, type: m.type,
+            instances: (m.loaded_instances || []).map(i => i.id),
+            loaded: (m.loaded_instances || []).length > 0,
+            vision: !!(m.capabilities && m.capabilities.vision),
+            size: m.size_bytes, params: m.params_string
+          }));
+          modelsDetailed = true; canManage = true;
+          return { state: "online", text: "PC online" };
+        }
+      }
+      canManage = false;
+      // older LM Studio API (v0)
+      res = await timedFetch(base() + "/api/v0/models", timeoutMs);
       if (res.ok) {
         const j = await res.json();
         const list = (j.data || []).filter(m => m.type !== "embeddings" && !/embed/i.test(m.id));
-        models = list.map(m => ({ id: m.id, type: m.type, loaded: m.state === "loaded", vision: m.type === "vlm" }));
+        models = list.map(m => ({ id: m.id, type: m.type, loaded: m.state === "loaded", instances: m.state === "loaded" ? [m.id] : [], vision: m.type === "vlm" }));
         modelsDetailed = true;
         return { state: "online", text: "PC online" };
       }
@@ -423,18 +449,63 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
     list.innerHTML = "";
     const sorted = [...models].sort((a, b) => (b.loaded - a.loaded) || a.id.localeCompare(b.id));
     for (const m of sorted) {
-      const b = document.createElement("button");
-      b.className = "model" + (m.id === sel ? " sel" : "");
-      b.innerHTML = '<span class="tick">' + (m.id === sel ? "✓" : "") + '</span><span class="mn"><b>' + esc(shortModel(m.id)) + "</b><small>" + esc(m.id) + "</small></span>" +
+      const row = document.createElement("div");
+      row.className = "model" + (m.id === sel ? " sel" : "");
+      const gb = m.size ? (m.size / 1e9).toFixed(1) + " GB" : "";
+      const sub = [m.params, gb].filter(Boolean).join(" · ") || m.id;
+      const pick = document.createElement("button");
+      pick.className = "pick";
+      pick.innerHTML = '<span class="tick">' + (m.id === sel ? "✓" : "") + '</span><span class="mn"><b>' + esc(m.name || shortModel(m.id)) + "</b><small>" + esc(sub) + "</small>" +
         '<span class="badges">' + (modelsDetailed && m.loaded ? '<span class="badge on">Loaded</span>' : "") +
-        (m.vision ? '<span class="badge vis">Vision</span>' : "") + "</span>";
-      b.onclick = () => {
+        (m.vision ? '<span class="badge vis">Vision</span>' : "") + "</span></span>";
+      pick.onclick = () => {
         settings.model = m.id; ls.set("settings", settings);
         updateTitle(); closeSheet("modelSheet");
         toast(modelsDetailed && !m.loaded ? "Switched to " + shortModel(m.id) + ". It'll load when you send a message." : "Switched to " + shortModel(m.id));
       };
-      list.appendChild(b);
+      row.appendChild(pick);
+      if (canManage) {
+        const act = document.createElement("button");
+        act.className = "act" + (m.loaded ? "" : " load");
+        act.textContent = busyModel === m.id ? (m.loaded ? "Unloading…" : "Loading…") : (m.loaded ? "Unload" : "Load");
+        act.disabled = !!busyModel || !!controller;
+        act.onclick = () => (m.loaded ? unloadModel(m) : loadModel(m));
+        row.appendChild(act);
+      }
+      list.appendChild(row);
     }
+  }
+
+  async function postJSON(path, body) {
+    const res = await fetch(base() + path, { method: "POST", headers: headers(), body: JSON.stringify(body) });
+    let j = null; try { j = await res.json(); } catch {}
+    if (!res.ok) throw new Error((j && j.error && (j.error.message || j.error)) || ("Error " + res.status));
+    return j;
+  }
+
+  async function unloadModel(m) {
+    busyModel = m.id; renderModels();
+    try {
+      for (const id of (m.instances.length ? m.instances : [m.id])) await postJSON("/api/v1/models/unload", { instance_id: id });
+      toast("Unloaded " + shortModel(m.id));
+    } catch (e) { toast("Couldn't unload: " + e.message, 4000); }
+    busyModel = null;
+    await checkStatus(); renderModels();
+  }
+
+  async function loadModel(m) {
+    busyModel = m.id; renderModels();
+    try {
+      // free memory first: unload whatever else is loaded
+      for (const other of models.filter(x => x.loaded && x.id !== m.id))
+        for (const id of (other.instances.length ? other.instances : [other.id])) await postJSON("/api/v1/models/unload", { instance_id: id });
+      toast("Loading " + shortModel(m.id) + " on your PC… this can take a minute.", 60000);
+      const r = await postJSON("/api/v1/models/load", { model: m.id });
+      settings.model = m.id; ls.set("settings", settings);
+      toast(shortModel(m.id) + " loaded" + (r && r.load_time_seconds ? " in " + Math.round(r.load_time_seconds) + "s" : "") + " ✓");
+    } catch (e) { toast("Couldn't load: " + e.message, 5000); }
+    busyModel = null;
+    await checkStatus(); updateTitle(); renderModels();
   }
 
   // ---------- rendering ----------
