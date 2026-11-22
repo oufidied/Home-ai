@@ -35,7 +35,7 @@ try:
 except ImportError:  # pragma: no cover
     ZoneInfo = None
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 DROPS = os.path.join(DATA, "drops")
@@ -178,6 +178,7 @@ S = {
     "pi_models": [], "pi_checked": 0.0,
     "model_busy": None, "last_tps": None,
     "active": {},           # device id -> last time its app was open on screen
+    "awake_since": 0.0,
 }
 JOBS = {}
 SESSION = None
@@ -205,6 +206,10 @@ async def check_pc(max_age=3.0):
     t = now()
     if t - S["checked"] < max_age:
         return S["pc"] == "awake"
+    # While the PC sleeps, leave it alone: network traffic can wake some PCs up.
+    # The PC helper checks in by itself as soon as the PC wakes, so we'll know.
+    if S["pc"] in ("asleep", "unknown") and t >= S["waking_until"] and not agent_online() and t - S["checked"] < 600 and S["checked"]:
+        return False
     awake, lm = False, False
     try:
         async with SESSION.get(PC + "/v1/models", headers=auth_headers(), timeout=ClientTimeout(total=3)) as r:
@@ -217,6 +222,7 @@ async def check_pc(max_age=3.0):
     if awake:
         if S["pc"] != "awake":
             log("PC awake", "(LM Studio up)" if lm else "(LM Studio not ready)")
+            S["awake_since"] = now()
         S["pc"] = "awake"
         if lm:
             S["waking_until"] = 0
@@ -653,7 +659,7 @@ async def stream_openai(job, url, body, headers, retries=0):
             raise RuntimeError("Lost connection: " + str(e))
 
 
-async def run_job(job, req_model):
+async def run_job(job, req_model, pre_reason=None):
     m = job.msg
     meta = m["meta"]
     chat_id = m["chat_id"]
@@ -669,8 +675,8 @@ async def run_job(job, req_model):
         job.state()
         target, model, reason = await route(req_model, text, has_images, chat_id)
         meta["route"] = target
-        if reason:
-            meta["route_reason"] = reason
+        if reason or pre_reason:
+            meta["route_reason"] = reason or pre_reason
 
         if target == "pc":
             touch()
@@ -739,14 +745,14 @@ async def run_job(job, req_model):
                                        "/?chat=" + chat_id, "chat-" + chat_id, skip_active=True))
 
 
-def start_job(chat_id, req_model):
+def start_job(chat_id, req_model, reason=None):
     t = now()
     msg = {"id": new_id(), "chat_id": chat_id, "role": "assistant", "content": "", "reasoning": "", "images": [],
            "model": "", "status": "queued", "meta": {}, "created": t}
     save_msg(msg)
     job = Job(msg)
     JOBS[msg["id"]] = job
-    job.task = asyncio.ensure_future(run_job(job, req_model))
+    job.task = asyncio.ensure_future(run_job(job, req_model, reason))
     return msg
 
 
@@ -851,6 +857,8 @@ async def hub_status(request):
             "actions": S["actions"], "actions_error": S["actions_error"],
             "models": S["pc_models"], "model_busy": S["model_busy"],
             "last_tps": S["last_tps"],
+            "awake_seconds": ((S["metrics"] or {}).get("awake_seconds") if agent_online() and S["metrics"] else None)
+                             or (round(now() - S["awake_since"]) if S["pc"] == "awake" and S["awake_since"] else None),
             "queued_drops": queued_drops,
         },
         "pi": {"models": ["pi:" + x for x in pis], "stats": pi_stats(), "voice": bool(voice_paths()[0]),
@@ -936,6 +944,33 @@ async def chat_send(request):
     b = await body_json(request)
     if any(j.msg["chat_id"] == cid for j in JOBS.values()):
         return err("Still answering the last message", 409)
+    req_model = b.get("model") or "auto"
+    reason = None
+    if b.get("wake") != "yes":
+        # Work out who would answer. If that's the PC and it's asleep, ask the app first.
+        if b.get("regenerate"):
+            lu = db.execute("SELECT content, images FROM messages WHERE chat_id=? AND role='user' ORDER BY created DESC LIMIT 1", (cid,)).fetchone()
+            q_text, q_imgs = (lu["content"] if lu else ""), (json.loads(lu["images"] or "[]") if lu else [])
+        else:
+            q_text, q_imgs = (b.get("content") or "").strip(), b.get("images") or []
+        rm = req_model
+        if rm == "auto":
+            pr = next((p for p in presets() if p["id"] == c["preset"]), None)
+            if pr and pr.get("model"):
+                rm = pr["model"]
+        target, model, reason = await route(rm, q_text, bool(q_imgs), cid)
+        if target == "pc":
+            await check_pc()
+            if S["pc"] not in ("awake", "waking"):
+                await refresh_pc_models()
+                pis = await pi_models()
+                return J({"needs_wake": True, "model": model or pick_pc_model(), "reason": reason or "",
+                          "pi": ("pi:" + pis[0]) if pis else None})
+            req_model = model or "pc"
+        else:
+            req_model = "pi:" + model
+    elif req_model == "auto":
+        req_model = "pc"
     user = None
     if b.get("regenerate"):
         last = db.execute("SELECT id, role FROM messages WHERE chat_id=? ORDER BY created DESC LIMIT 1", (cid,)).fetchone()
@@ -955,7 +990,7 @@ async def chat_send(request):
             db.execute("UPDATE chats SET title=? WHERE id=?", (title, cid))
             db.commit()
     touch()
-    msg = start_job(cid, b.get("model") or "auto")
+    msg = start_job(cid, req_model, reason)
     chat_touch(cid)
     return J({"user": user, "assistant": msg})
 
@@ -1473,6 +1508,8 @@ async def agent_poll(request):
     S["agent_seen"] = t
     S["agent"] = {"version": b.get("version"), "host": b.get("host"), "idle": b.get("idle_seconds")}
     if t > S["sleeping_until"]:
+        if S["pc"] != "awake":
+            S["awake_since"] = t
         S["pc"] = "awake"
     if first:
         log("PC helper connected")
