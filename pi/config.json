@@ -3,10 +3,10 @@
   "pc_mac": "10:3D:1C:99:B0:E7",
   "broadcast": ["255.255.255.255", "192.168.0.255"],
   "wake_command": "",
-  "wake_timeout": 90,
-  "keep_awake_minutes": 10,
-  "token": "",
   "ollama_url": "http://127.0.0.1:11434",
-  "fallback": true,
-  "fallback_model": ""
+  "device_port": 8090,
+  "device_key": "",
+  "push_contact": "https://home-ai-ruby.vercel.app",
+  "whisper_dir": "~/whisper.cpp",
+  "whisper_model": "base"
 }
