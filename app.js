@@ -1,7 +1,7 @@
 /* Home AI v2 — app */
 (() => {
 "use strict";
-const VERSION = "2.0.0";
+const VERSION = "2.0.1";
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -52,6 +52,7 @@ if (!LS.get("hai2")) {
   if (old.url && !/arthur-pc/.test(old.url)) cfg.url = old.url;
 }
 const saveCfg = () => LS.set("hai2", cfg);
+let CID = LS.get("cid"); if (!CID) { CID = Math.random().toString(36).slice(2, 12); LS.set("cid", CID); }
 const base = () => cfg.url.trim().replace(/\/+$/, "");
 const authH = () => (cfg.token ? { Authorization: "Bearer " + cfg.token } : {});
 
@@ -107,17 +108,29 @@ function parts(m) {
   return { r: r.trim(), c: c.replace(/^\s+/, "") };
 }
 function inline(s) {
-  return s.replace(/`([^`\n]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+  return s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, "$1<em>$2</em>")
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 }
+function tex(src, display) {
+  if (window.katex) {
+    try { return katex.renderToString(src, { displayMode: display, throwOnError: false, output: "html", strict: "ignore" }); } catch {}
+  }
+  return esc(display ? "$$" + src + "$$" : "$" + src + "$");
+}
 function md(src) {
-  const blocks = [];
+  const blocks = [], spans = [];
   src = src.replace(/```([^\n`]*)\n?([\s\S]*?)(```|$)/g, (_, lang, code) => {
     blocks.push(`<pre><div class="code-head"><span>${esc(lang.trim() || "code")}</span><button class="cp">Copy</button></div><code>${esc(code.replace(/\n$/, ""))}</code></pre>`);
     return "\n\u0000" + (blocks.length - 1) + "\u0000\n";
   });
+  // protect inline code, then maths, from the markdown rules
+  const keep = html => { spans.push(html); return "\u0001" + (spans.length - 1) + "\u0001"; };
+  src = src.replace(/`([^`\n]+)`/g, (_, c) => keep("<code>" + esc(c) + "</code>"));
+  src = src.replace(/\$\$([\s\S]+?)\$\$/g, (_, m) => "\n\u0002" + keep(`<div class="math-block">${tex(m.trim(), true)}</div>`) + "\n");
+  src = src.replace(/\\\[([\s\S]+?)\\\]/g, (_, m) => "\n\u0002" + keep(`<div class="math-block">${tex(m.trim(), true)}</div>`) + "\n");
+  src = src.replace(/\\\((.+?)\\\)/g, (_, m) => keep(tex(m, false)));
+  src = src.replace(/(^|[^\\$\w])\$(?=\S)([^$\n]+?)(?<=\S)\$(?!\d)/g, (all, pre, m) => (/^[\d.,\s]+$/.test(m) ? all : pre + keep(tex(m, false))));
   const lines = esc(src).split("\n");
   const out = []; let list = null, para = [];
   const flushP = () => { if (para.length) { out.push("<p>" + inline(para.join("<br>")) + "</p>"); para = []; } };
@@ -125,6 +138,7 @@ function md(src) {
   for (let i = 0; i < lines.length; i++) {
     const ln = lines[i]; let m;
     if (/^\u0000\d+\u0000$/.test(ln.trim())) { flushP(); closeL(); out.push(ln.trim()); continue; }
+    if (/^\u0002\u0001\d+\u0001$/.test(ln.trim())) { flushP(); closeL(); out.push(ln.trim().slice(1)); continue; }
     if (/^\s*\|.*\|\s*$/.test(ln) && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
       flushP(); closeL();
       const cells = l => l.trim().replace(/^\||\|$/g, "").split("|").map(c => inline(c.trim()));
@@ -137,12 +151,12 @@ function md(src) {
     if (/^\s*(-{3,}|\*{3,})\s*$/.test(ln)) { flushP(); closeL(); out.push("<hr>"); continue; }
     if ((m = ln.match(/^\s*&gt;\s?(.*)/))) { flushP(); closeL(); out.push("<blockquote>" + inline(m[1]) + "</blockquote>"); continue; }
     if ((m = ln.match(/^\s*[-*•]\s+(.*)/))) { flushP(); if (list !== "ul") { closeL(); out.push("<ul>"); list = "ul"; } out.push("<li>" + inline(m[1]) + "</li>"); continue; }
-    if ((m = ln.match(/^\s*\d+[.)]\s+(.*)/))) { flushP(); if (list !== "ol") { closeL(); out.push("<ol>"); list = "ol"; } out.push("<li>" + inline(m[1]) + "</li>"); continue; }
+    if ((m = ln.match(/^\s*(\d+)[.)]\s+(.*)/))) { flushP(); if (list !== "ol") { closeL(); out.push(m[1] !== "1" ? `<ol start="${+m[1]}">` : "<ol>"); list = "ol"; } out.push("<li>" + inline(m[2]) + "</li>"); continue; }
     if (ln.trim() === "") { flushP(); closeL(); continue; }
     closeL(); para.push(ln);
   }
   flushP(); closeL();
-  return out.join("").replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[+i]);
+  return out.join("").replace(/\u0002/g, "").replace(/\u0001(\d+)\u0001/g, (_, i) => spans[+i]).replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[+i]);
 }
 
 /* ------------------------------------------------------------------ tabs */
@@ -163,7 +177,7 @@ let pollTimer = null;
 async function poll() {
   clearTimeout(pollTimer);
   try {
-    st.status = await api("/hub/status" + (document.hidden ? "" : "?active=1"), { timeout: 8000 });
+    st.status = await api("/hub/status" + (document.hidden ? "" : "?active=1&cid=" + CID), { timeout: 8000 });
     st.online = true;
   } catch (e) {
     st.online = false; st.statusErr = e;
@@ -1080,7 +1094,13 @@ $("#settingsPage").addEventListener("click", async e => {
   if (t.id === "reloadApp") location.reload();
   if (t.id === "wipeAll") { if (confirm("Delete ALL chats on every device? This can't be undone.")) { await api("/hub/chats", { method: "DELETE" }).catch(er => toast(er.message)); newChat(); loadChats(); toast("All chats deleted"); } }
   if (t.id === "notifOn") enableNotifications();
-  if (t.id === "notifTest") { try { const r = await api("/hub/push/test", { method: "POST" }); toast("Sent to " + r.devices + " device" + (r.devices > 1 ? "s" : "")); } catch (er) { toast(er.message); } }
+  if (t.id === "notifTest") {
+    try {
+      const r = await api("/hub/push/test", { method: "POST", timeout: 30000 });
+      if (r.errors && r.errors.length) toast("Delivery failed: " + r.errors[0], 8000);
+      else toast("Sent to " + r.sent + " device" + (r.sent === 1 ? "" : "s") + ". Lock your phone to see it.", 4000);
+    } catch (er) { toast(er.message, 5000); }
+  }
 });
 
 /* ------------------------------------------------------------------ notifications */
@@ -1105,6 +1125,14 @@ async function renderNotif() {
   }
   box.innerHTML = h;
 }
+async function refreshPushSub() {
+  try {
+    if (!("PushManager" in window) || Notification.permission !== "granted") return;
+    const reg = swReg || await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) await api("/hub/push/subscribe", { method: "POST", body: { subscription: sub.toJSON(), cid: CID } });
+  } catch {}
+}
 function b64ToBytes(b64) { const p = "=".repeat((4 - b64.length % 4) % 4); const s = atob((b64 + p).replace(/-/g, "+").replace(/_/g, "/")); return Uint8Array.from([...s].map(c => c.charCodeAt(0))); }
 async function enableNotifications() {
   try {
@@ -1114,7 +1142,7 @@ async function enableNotifications() {
     const reg = swReg || await navigator.serviceWorker.ready;
     let sub = await reg.pushManager.getSubscription();
     if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(key) });
-    await api("/hub/push/subscribe", { method: "POST", body: { subscription: sub.toJSON() } });
+    await api("/hub/push/subscribe", { method: "POST", body: { subscription: sub.toJSON(), cid: CID } });
     toast("Notifications on 🔔");
   } catch (e) { toast("Couldn't turn on notifications: " + e.message, 4500); }
   renderNotif();
@@ -1158,9 +1186,10 @@ async function boot() {
   await Promise.all([poll(), loadSettings()]);
   if (st.online === false && st.statusErr && st.statusErr.status !== 401) { /* keep the app usable, status shows offline */ }
   renderChat(); updateModelPill(); setSending();
-  loadChats(); readLegacy(); registerSW();
+  loadChats(); readLegacy(); registerSW().then(refreshPushSub);
   if (location.search) handleUrl(location.href);
 }
+window.addEventListener("katex-ready", () => { if (st.msgs.length) renderChat(); });
 paintIcons();
 boot();
 })();

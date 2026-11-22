@@ -123,9 +123,12 @@ svg { flex: none; }
 .md pre code { display: block; background: none; padding: 12px; overflow-x: auto; white-space: pre; }
 .md .tbl { overflow-x: auto; margin: .5em 0 .9em; }
 .md table { border-collapse: collapse; font-size: 14px; min-width: 100%; }
-.md th, .md td { border: 1px solid var(--line); padding: 6px 10px; text-align: left; vertical-align: top; }
+.md th, .md td { border: 1px solid var(--line); padding: 6px 10px; text-align: left; vertical-align: top; overflow-wrap: normal; word-break: normal; hyphens: auto; }
 .md th { background: var(--surface); font-weight: 600; }
 .md a { color: var(--blue); }
+.md .math-block { overflow-x: auto; overflow-y: hidden; margin: .5em 0 .8em; padding: 2px 0; }
+.md .katex { font-size: 1.08em; }
+.md .math-block .katex-display { margin: 0; }
 
 details.think { margin: 0 0 10px; border-left: 2px solid var(--line-2); padding-left: 12px; color: var(--muted); font-size: 14px; }
 details.think summary { list-style: none; cursor: pointer; font-size: 13px; color: var(--faint); user-select: none; }
