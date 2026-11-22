@@ -47,6 +47,11 @@ json.dump(cfg, open(path, "w"), indent=2)
 print("    device key for your ESP32s:", cfg["device_key"])
 PY
 
+echo "==> Allowing the hub to shut the Pi down (for emergency shutdown only)"
+echo "$USER_NAME ALL=(root) NOPASSWD: /usr/sbin/shutdown" | sudo tee /etc/sudoers.d/home-ai >/dev/null
+sudo chmod 440 /etc/sudoers.d/home-ai
+sudo visudo -cf /etc/sudoers.d/home-ai >/dev/null || { echo "    sudoers check failed - removing"; sudo rm -f /etc/sudoers.d/home-ai; }
+
 echo "==> Background service"
 sudo tee /etc/systemd/system/home-ai-gateway.service >/dev/null <<EOF
 [Unit]

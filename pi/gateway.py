@@ -16,6 +16,9 @@ Settings: config.json next to this file. Data: ./data/
 """
 import asyncio
 import base64
+import hashlib
+import hmac
+import secrets
 import json
 import os
 import re
@@ -35,7 +38,7 @@ try:
 except ImportError:  # pragma: no cover
     ZoneInfo = None
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 DROPS = os.path.join(DATA, "drops")
@@ -56,6 +59,7 @@ DEFAULTS = {
     "push_contact": "https://home-ai-ruby.vercel.app",
     "whisper_dir": "~/whisper.cpp",
     "whisper_model": "base",
+    "pi_shutdown_command": "sudo -n /usr/sbin/shutdown -h now",
 }
 CFG_PATH = os.path.join(HERE, "config.json")
 CFG = dict(DEFAULTS)
@@ -179,6 +183,8 @@ S = {
     "model_busy": None, "last_tps": None,
     "active": {},           # device id -> last time its app was open on screen
     "awake_since": 0.0,
+    "apps": [],
+    "emerg_fails": [],
 }
 JOBS = {}
 SESSION = None
@@ -855,6 +861,7 @@ async def hub_status(request):
             "metrics": S["metrics"] if agent_online() else None,
             "hist": S["hist"][-72:] if agent_online() else [],
             "actions": S["actions"], "actions_error": S["actions_error"],
+            "apps": S["apps"] if agent_online() else [],
             "models": S["pc_models"], "model_busy": S["model_busy"],
             "last_tps": S["last_tps"],
             "awake_seconds": ((S["metrics"] or {}).get("awake_seconds") if agent_online() and S["metrics"] else None)
@@ -1134,6 +1141,103 @@ async def pc_clipboard(request):
         return err("The PC is asleep or the helper isn't running.", 409)
     queue_cmd("get_clipboard")
     return J({"ok": True})
+
+
+async def pc_app_close(request):
+    b = await body_json(request)
+    if not agent_online():
+        return err("The PC is asleep or the helper isn't running.", 409)
+    try:
+        pid = int(b.get("pid"))
+    except (TypeError, ValueError):
+        return err("Bad app")
+    app = next((a for a in S["apps"] if a.get("pid") == pid), None)
+    if not app:
+        return err("That app isn't open any more.", 404)
+    queue_cmd("close_app", pid=pid, name=app.get("name"), force=bool(b.get("force")))
+    return J({"ok": True})
+
+
+# ================================================================== emergency shutdown
+RESET_FLAG = os.path.join(HERE, "reset-password")
+
+
+def pw_hash(pw, salt):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200000).hex()
+
+
+def pw_check(pw):
+    rec = kv_get("emergency_pw")
+    if not rec:
+        return False
+    return hmac.compare_digest(pw_hash(pw, rec["salt"]), rec["hash"])
+
+
+def pw_locked():
+    t = now()
+    S["emerg_fails"] = [x for x in S["emerg_fails"] if t - x < 600]
+    return len(S["emerg_fails"]) >= 5
+
+
+async def emergency_status(request):
+    return J({"set": bool(kv_get("emergency_pw")), "locked": pw_locked()})
+
+
+async def emergency_password(request):
+    b = await body_json(request)
+    new = b.get("new") or ""
+    if len(new) < 4:
+        return err("Use at least 4 characters.")
+    if kv_get("emergency_pw"):
+        if pw_locked():
+            return err("Too many wrong tries. Wait 10 minutes.", 429)
+        if not pw_check(b.get("current") or ""):
+            S["emerg_fails"].append(now())
+            return err("The current password is wrong.", 403)
+    salt = secrets.token_hex(16)
+    kv_set("emergency_pw", {"salt": salt, "hash": pw_hash(new, salt)})
+    return J({"ok": True})
+
+
+async def shutdown_pi_later(delay):
+    await asyncio.sleep(delay)
+    log("EMERGENCY: shutting down the Pi")
+    try:
+        p = await asyncio.create_subprocess_shell(CFG["pi_shutdown_command"], stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await asyncio.wait_for(p.communicate(), 20)
+        if p.returncode:
+            add_result("emergency", "Pi shutdown", False, out.decode(errors="ignore")[:200] or "sudo isn't allowed - re-run the Pi installer")
+    except Exception as e:
+        add_result("emergency", "Pi shutdown", False, str(e))
+
+
+async def emergency(request):
+    b = await body_json(request)
+    if not kv_get("emergency_pw"):
+        return err("Set an emergency password in Settings first.", 400)
+    if pw_locked():
+        return err("Too many wrong tries. Wait 10 minutes.", 429)
+    if not pw_check(b.get("password") or ""):
+        S["emerg_fails"].append(now())
+        left = 5 - len(S["emerg_fails"])
+        return err("Wrong password." + (" %d tries left." % left if left > 0 else ""), 403)
+    S["emerg_fails"] = []
+    do_pc, do_pi = b.get("pc", True), b.get("pi", True)
+    log("EMERGENCY SHUTDOWN requested (pc=%s, pi=%s)" % (do_pc, do_pi))
+    res = {}
+    if do_pc:
+        if agent_online():
+            queue_cmd("shutdown")
+            S["last_activity"] = 0
+            S["sleeping_until"] = now() + 120
+            res["pc"] = "Shutting down"
+        else:
+            res["pc"] = "Already asleep or off - left as it is"
+    if do_pi:
+        asyncio.ensure_future(shutdown_pi_later(25 if do_pc and agent_online() else 5))
+        res["pi"] = "Shutting down in a few seconds"
+    add_result("emergency", "Emergency shutdown", True, ", ".join("%s: %s" % (k.upper(), v) for k, v in res.items()))
+    return J({"ok": True, **res})
 
 
 async def game_mode(request):
@@ -1522,6 +1626,8 @@ async def agent_poll(request):
         S["hist"].append({"t": round(t), "cpu": mt.get("cpu"), "ram": round(100 * mt["ram_used"] / mt["ram_total"]) if mt.get("ram_total") else None,
                           "gpu": g.get("util"), "gpu_temp": g.get("temp"), "vram": round(100 * g["mem_used"] / g["mem_total"]) if g.get("mem_total") else None})
         del S["hist"][:-180]
+    if "apps" in b:
+        S["apps"] = sorted(b.get("apps") or [], key=lambda a: (str(a.get("name") or "")).lower())
     if "actions" in b:
         S["actions"] = b.get("actions") or []
         S["actions_error"] = b.get("actions_error")
@@ -1642,6 +1748,11 @@ async def proxy(request):
 async def on_startup(app):
     global SESSION
     SESSION = ClientSession()
+    if os.path.exists(RESET_FLAG):
+        db.execute("DELETE FROM kv WHERE k='emergency_pw'")
+        db.commit()
+        os.remove(RESET_FLAG)
+        log("Emergency password cleared (reset-password file found)")
     # any answer that was mid-way when the hub restarted
     db.execute("UPDATE messages SET status='error', meta=json_set(COALESCE(meta,'{}'),'$.error','Interrupted (the Pi restarted)') "
                "WHERE status NOT IN ('done','error','stopped')")
@@ -1688,6 +1799,10 @@ def make_app():
     r.add_post("/hub/pc/action", pc_action)
     r.add_post("/hub/pc/clipboard", pc_clipboard)
     r.add_post("/hub/game", game_mode)
+    r.add_post("/hub/pc/app/close", pc_app_close)
+    r.add_get("/hub/emergency", emergency_status)
+    r.add_post("/hub/emergency/password", emergency_password)
+    r.add_post("/hub/emergency", emergency)
     r.add_post("/hub/models", models_op)
     r.add_get("/hub/schedules", schedules_list)
     r.add_post("/hub/schedules", schedules_create)
