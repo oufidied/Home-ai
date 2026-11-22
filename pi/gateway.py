@@ -35,7 +35,7 @@ try:
 except ImportError:  # pragma: no cover
     ZoneInfo = None
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 DROPS = os.path.join(DATA, "drops")
@@ -177,6 +177,7 @@ S = {
     "pc_models": [], "pc_models_at": 0.0,
     "pi_models": [], "pi_checked": 0.0,
     "model_busy": None, "last_tps": None,
+    "active": {},           # device id -> last time its app was open on screen
 }
 JOBS = {}
 SESSION = None
@@ -418,29 +419,47 @@ except Exception as e:  # push is optional
 
 
 def _send_one(sub, payload):
+    """Returns (keep_subscription, error_or_None)."""
     try:
-        webpush(subscription_info=sub, data=json.dumps(payload), vapid_private_key=PUSH["key_path"],
-                vapid_claims={"sub": CFG["push_contact"]}, ttl=3600, timeout=10)
-        return True
+        webpush(subscription_info={"endpoint": sub["endpoint"], "keys": sub["keys"]}, data=json.dumps(payload),
+                vapid_private_key=PUSH["key_path"], vapid_claims={"sub": CFG["push_contact"]},
+                ttl=3600, timeout=10, headers={"Urgency": "high"})
+        return True, None
     except WebPushException as e:
         code = getattr(e.response, "status_code", None)
-        log("push failed", code, str(e)[:120])
-        return code not in (404, 410)
+        detail = ""
+        try:
+            detail = e.response.text[:200]
+        except Exception:
+            pass
+        log("push failed", code, detail or str(e)[:150])
+        return code not in (404, 410), "%s %s" % (code, detail or str(e)[:150])
     except Exception as e:
         log("push failed", e)
-        return True
+        return True, str(e)[:150]
 
 
-async def push(title, body, url="/", tag=None):
+async def push(title, body, url="/", tag=None, skip_active=False):
+    """Send a notification to every subscribed device. skip_active: not to devices that have the app open right now."""
     if not PUSH["ok"]:
-        return
+        return {"sent": 0, "skipped": 0, "errors": ["push not available on the Pi"]}
     payload = {"title": title, "body": body[:180], "url": url, "tag": tag or new_id()}
     loop = asyncio.get_running_loop()
+    out = {"sent": 0, "skipped": 0, "errors": []}
     for r in db.execute("SELECT endpoint, data FROM push_subs").fetchall():
-        keep = await loop.run_in_executor(None, _send_one, json.loads(r["data"]), payload)
+        sub = json.loads(r["data"])
+        if skip_active and sub.get("cid") and now() - S["active"].get(sub["cid"], 0) < 15:
+            out["skipped"] += 1
+            continue
+        keep, error = await loop.run_in_executor(None, _send_one, sub, payload)
+        if error:
+            out["errors"].append(error)
+        else:
+            out["sent"] += 1
         if not keep:
             db.execute("DELETE FROM push_subs WHERE endpoint=?", (r["endpoint"],))
             db.commit()
+    return out
 
 
 # ================================================================== chat jobs
@@ -713,11 +732,11 @@ async def run_job(job, req_model):
         job.state()
         job.publish({"t": "end"})
         JOBS.pop(m["id"], None)
-        if m["status"] in ("done", "error") and not job.subs and settings()["notify_answers"]:
+        if m["status"] in ("done", "error") and settings()["notify_answers"]:
             chat = db.execute("SELECT title FROM chats WHERE id=?", (chat_id,)).fetchone()
             body = strip_think(m["content"]) if m["status"] == "done" else ("⚠️ " + meta.get("error", "Something went wrong"))
-            asyncio.ensure_future(push((chat["title"] if chat else None) or "Home AI", body or "Answer ready",
-                                       "/?chat=" + chat_id, "chat-" + chat_id))
+            asyncio.ensure_future(push((chat["title"] if chat else None) or "Home AI", plain(body) or "Answer ready",
+                                       "/?chat=" + chat_id, "chat-" + chat_id, skip_active=True))
 
 
 def start_job(chat_id, req_model):
@@ -811,8 +830,12 @@ def voice_paths():
 
 async def hub_status(request):
     await check_pc()
-    if S["pc"] == "awake" and request.query.get("active") == "1":
-        touch()
+    if request.query.get("active") == "1":
+        cid = request.query.get("cid")
+        if cid:
+            S["active"][cid[:40]] = now()
+        if S["pc"] == "awake":
+            touch()
     await refresh_pc_models()
     pis = await pi_models()
     queued_drops = db.execute("SELECT COUNT(*) c FROM drops WHERE dir='to_pc' AND delivered IS NULL").fetchone()["c"]
@@ -1312,8 +1335,9 @@ async def push_key(request):
 async def push_subscribe(request):
     b = await body_json(request)
     sub = b.get("subscription") or {}
-    if not sub.get("endpoint"):
+    if not sub.get("endpoint") or not sub.get("keys"):
         return err("Bad subscription")
+    sub = {"endpoint": sub["endpoint"], "keys": sub["keys"], "cid": (b.get("cid") or "")[:40]}
     db.execute("INSERT INTO push_subs(endpoint,data,created) VALUES(?,?,?) ON CONFLICT(endpoint) DO UPDATE SET data=excluded.data",
                (sub["endpoint"], json.dumps(sub), now()))
     db.commit()
@@ -1331,8 +1355,8 @@ async def push_test(request):
     n = db.execute("SELECT COUNT(*) c FROM push_subs").fetchone()["c"]
     if not n:
         return err("No device has turned on notifications yet", 404)
-    await push("Home AI 🔔", "Notifications are working!", "/", "test")
-    return J({"ok": True, "devices": n})
+    r = await push("Home AI 🔔", "Notifications are working!", "/", "test")
+    return J({"ok": not r["errors"], "devices": n, "sent": r["sent"], "errors": r["errors"]})
 
 
 # ================================================================== voice (whisper.cpp on the Pi)
