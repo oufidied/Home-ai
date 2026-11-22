@@ -1,7 +1,7 @@
 /* Home AI v2 — app */
 (() => {
 "use strict";
-const VERSION = "2.0.1";
+const VERSION = "2.1.0";
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -82,7 +82,7 @@ let toastT;
 function toast(msg, ms = 2800) { const t = $("#toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), ms); }
 const short = id => id ? String(id).replace(/^pi:/, "").split("/").pop() : "";
 const fmtBytes = b => { if (b == null) return "—"; const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; } return (b >= 100 || i === 0 ? Math.round(b) : b.toFixed(1)) + " " + u[i]; };
-const fmtDur = s => { s = Math.max(0, Math.round(s)); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`; };
+const fmtDur = s => { s = Math.max(0, Math.round(s)); if (s < 60) return "less than a minute"; const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`; };
 const mmss = s => { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
 function ago(t) {
   const s = Date.now() / 1000 - t;
@@ -439,9 +439,9 @@ $("#messages").addEventListener("click", e => {
   const a = b.dataset.act;
   if (a === "copy") copyText(parts(m).c, b);
   if (a === "listen") toggleSpeak(m);
-  if (a === "retry") regenerate(m.model && m.meta && m.meta.route === "pc" ? m.model : cfg.model);
-  if (a === "ask-pc") regenerate("pc");
-  if (a === "ask-pi") { const pis = st.status.pi.models; regenerate(pis[0]); }
+  if (a === "retry") regenerate(m.model && m.meta && m.meta.route === "pc" ? m.model : cfg.model, m.meta && m.meta.error_code === "wake_failed" ? "yes" : "ask");
+  if (a === "ask-pc") regenerate("pc", "yes");
+  if (a === "ask-pi") { const pis = st.status.pi.models; regenerate(pis[0], "yes"); }
 });
 
 /* ------------------------------------------------------------------ streaming */
@@ -491,20 +491,55 @@ function onAnswerDone(m) {
 function runningMsg() { return st.msgs.find(m => m.role === "assistant" && !FINAL.includes(m.status)); }
 
 /* ------------------------------------------------------------------ sending */
+// Ask the hub to answer. If the PC would have to wake up, ask first.
+function askWake(r) {
+  return new Promise(resolve => {
+    const pc = short(r.model) || "your PC's model";
+    let h = `<div class="grab"></div><h3>Your PC is asleep</h3>
+      <p class="muted small" style="margin:-6px 0 12px">This one needs the bigger model on your PC. Waking it takes a minute or two.</p>` +
+      opt("wake", "⚡", "Wake the PC and use " + pc, "Answers with the big model once the PC is up") +
+      (r.pi ? opt("pi", "🍓", "No, ask the Pi instead", short(r.pi) + " answers right away. The PC keeps sleeping.") : "") +
+      opt("cancel", "✕", "No, cancel", "Nothing is sent");
+    let done = false;
+    const finish = v => { if (!done) { done = true; resolve(v); } };
+    openSheet(h, e => { const b = e.target.closest("[data-opt]"); if (!b) return; closeSheet(); finish(b.dataset.opt); });
+    const obs = new MutationObserver(() => { if (!$("#sheet").classList.contains("open")) { obs.disconnect(); finish("cancel"); } });
+    obs.observe($("#sheet"), { attributes: true, attributeFilter: ["class"] });
+  });
+}
+async function postSend(body) {
+  let r = await api("/hub/chats/" + st.chat.id + "/send", { method: "POST", body: { ...body, wake: body.wake || "ask" }, timeout: 30000 });
+  if (r && r.needs_wake) {
+    const choice = await askWake(r);
+    if (choice === "cancel") return null;
+    const again = choice === "pi" ? { ...body, model: r.pi, wake: "yes" } : { ...body, model: body.model && body.model !== "auto" ? body.model : "pc", wake: "yes" };
+    r = await api("/hub/chats/" + st.chat.id + "/send", { method: "POST", body: again, timeout: 30000 });
+  }
+  return r;
+}
+
 async function sendMessage() {
   const text = $("#input").value.trim();
   if ((!text && !st.pending.length) || runningMsg()) return;
   stopRec();
   const mi = modelInfo(cfg.model);
   if (st.pending.length && mi && mi.vision === false) { toast(short(cfg.model) + " can't see images. Pick another model."); return; }
+  const images = st.pending.slice();
+  let created = false;
   try {
     if (!st.chat) {
       st.chat = await api("/hub/chats", { method: "POST", body: { preset: st.newPreset } });
-      st.msgs = [];
+      st.msgs = []; created = true;
     }
-    const body = { content: text, images: st.pending.slice(), model: cfg.model || "auto" };
+    const body = { content: text, images, model: cfg.model || "auto" };
     $("#input").value = ""; autosize(); st.pending = []; renderPending();
-    const r = await api("/hub/chats/" + st.chat.id + "/send", { method: "POST", body, timeout: 30000 });
+    $("#send").disabled = true;
+    const r = await postSend(body);
+    if (!r) {   // cancelled: put the message back
+      $("#input").value = text; st.pending = images; renderPending(); autosize();
+      if (created) { api("/hub/chats/" + st.chat.id, { method: "DELETE" }).catch(() => {}); st.chat = null; renderChat(); }
+      return;
+    }
     if (r.user) st.msgs.push(r.user);
     st.msgs.push(r.assistant);
     if (!st.chat.title && text) st.chat.title = text.slice(0, 60);
@@ -518,10 +553,11 @@ async function sendMessage() {
     if (text && !$("#input").value) { $("#input").value = text; autosize(); }
   }
 }
-async function regenerate(model) {
+async function regenerate(model, wake) {
   if (!st.chat || runningMsg()) return;
   try {
-    const r = await api("/hub/chats/" + st.chat.id + "/send", { method: "POST", body: { regenerate: true, model: model || "auto" } });
+    const r = await postSend({ regenerate: true, model: model || "auto", wake: wake || "ask" });
+    if (!r) return;
     if (st.msgs.length && st.msgs[st.msgs.length - 1].role === "assistant") st.msgs.pop();
     st.msgs.push(r.assistant);
     renderChat(); setSending(); attachStream(r.assistant.id);
@@ -717,7 +753,7 @@ function renderPC() {
   orb.className = "orb " + i.cls;
   $("#pcState").textContent = st.online ? (i.cls === "awake" ? "Your PC is awake" : i.cls === "asleep" ? "Your PC is asleep" : i.title) : "Can't reach your Pi";
   let sub = i.sub;
-  if (st.online && i.cls === "awake" && s.pc.metrics) sub = "Up for " + fmtDur(s.pc.metrics.uptime) + (s.pc.agent_info && s.pc.agent_info.idle < 120 ? ", someone's at the desk" : "");
+  if (st.online && i.cls === "awake" && s.pc.awake_seconds != null) sub = "Awake for " + fmtDur(s.pc.awake_seconds) + (s.pc.agent_info && s.pc.agent_info.idle < 120 ? ", someone's at the desk" : "");
   else if (st.online && i.cls === "awake" && !s.pc.agent) sub = "The PC helper isn't connected, so stats and power buttons are off.";
   $("#pcSub").textContent = sub || " ";
   // power row
