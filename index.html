@@ -227,7 +227,7 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
   <div class="sheet-card">
     <h3><span>Settings</span><button class="icon-btn" data-close aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></h3>
     <div class="field">
-      <label for="sUrl">PC address (Tailscale)</label>
+      <label for="sUrl">Address (your Pi, or the PC directly)</label>
       <input id="sUrl" type="url" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false">
     </div>
     <div class="field">
@@ -286,6 +286,8 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
   let modelsDetailed = false;
   let canManage = false;    // LM Studio supports load/unload over the API
   let busyModel = null;     // model currently being loaded/unloaded from the app
+  let gw = null;            // Pi gateway status (null = talking to the PC directly)
+  let piModels = [];        // models running on the Pi (Ollama)
   let controller = null;
   let status = "checking";
   let pending = [];         // images attached to the next message (data URLs)
@@ -358,7 +360,7 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
   // ---------- models & status ----------
   function setStatus(s, text) {
     status = s;
-    els.pill.className = "pill " + (s === "online" ? "online" : s === "checking" ? "checking" : s === "setup" ? "" : "error");
+    els.pill.className = "pill " + (s === "online" ? "online" : s === "checking" ? "checking" : (s === "setup" || s === "asleep") ? "" : "error");
     els.pillText.textContent = text;
   }
 
@@ -369,8 +371,7 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
   }
 
   // Returns {state, text}; fills `models`.
-  async function probe(timeoutMs = 6000) {
-    if (!base()) return { state: "setup", text: "Enter your PC address first" };
+  async function probePc(timeoutMs = 6000) {
     try {
       // LM Studio's REST API v1: full info (loaded instances, vision, size)
       let res = await timedFetch(base() + "/api/v1/models", timeoutMs);
@@ -415,13 +416,83 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
     }
   }
 
+  // Talks to the Pi gateway if there is one, otherwise straight to the PC.
+  async function gwFetchStatus(timeoutMs) {
+    const r = await timedFetch(base() + "/gw/status" + (document.hidden ? "" : "?active=1"), timeoutMs);
+    if (r.status === 401 || r.status === 403) return { auth: false };
+    if (!r.ok) return null;
+    const j = await r.json().catch(() => null);
+    return j && j.gateway ? j : null;
+  }
+
+  async function probe(timeoutMs = 6000) {
+    if (!base()) return { state: "setup", text: "Enter your PC address first" };
+    let g = null;
+    try { g = await gwFetchStatus(timeoutMs); }
+    catch { gw = null; return { state: "offline", text: "Can't reach it" }; }
+    if (g && g.auth === false) return { state: "error", text: "Token rejected" };
+    gw = g;
+    if (!gw) {
+      const r = await probePc(timeoutMs);
+      if (r.state === "offline") r.text = "PC offline";
+      return r;
+    }
+    piModels = (gw.pi_models || []).map(n => ({ id: "pi:" + n, name: n + " (Pi)", pi: true, loaded: true, instances: [], vision: false }));
+    if (gw.pc === "awake" && gw.lm) {
+      const r = await probePc(timeoutMs);
+      if (r.state === "online") {
+        ls.set("pcModels", models.map(m => ({ id: m.id, name: m.name, type: m.type, vision: m.vision, size: m.size, params: m.params })));
+        models = models.concat(piModels);
+        return { state: "online", text: "PC awake" };
+      }
+    }
+    canManage = false;
+    models = ls.get("pcModels", []).map(m => Object.assign({}, m, { loaded: false, instances: [] })).concat(piModels);
+    if (gw.pc === "awake") return { state: "error", text: "LM Studio server off" };
+    if (gw.pc === "waking") return { state: "checking", text: "Waking PC…" };
+    return { state: "asleep", text: "PC asleep · tap to wake" };
+  }
+
+  // Wake the PC through the Pi and wait until LM Studio answers.
+  let waking = null;
+  function wakePc(signal) {
+    if (waking) return waking;
+    waking = (async () => {
+      setStatus("checking", "Waking PC…");
+      try { await fetch(base() + "/gw/wake", { method: "POST", headers: headers() }); } catch {}
+      const limit = Date.now() + ((gw && gw.wake_timeout) || 90) * 1000 + 10000;
+      while (Date.now() < limit) {
+        if (signal && signal.aborted) return false;
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const g = await gwFetchStatus(4000);
+          if (g && g.gateway) { gw = g; if (g.pc === "awake" && g.lm) return true; }
+        } catch {}
+      }
+      return false;
+    })();
+    waking.finally(() => { waking = null; });
+    return waking;
+  }
+
+  async function sleepPc() {
+    try {
+      const r = await fetch(base() + "/gw/sleep", { method: "POST", headers: headers() });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { toast((j.error && j.error.message) || "Couldn't put the PC to sleep.", 4500); return; }
+      toast("Your PC is going to sleep 💤");
+      setStatus("checking", "PC going to sleep…");
+      setTimeout(checkStatus, 15000);
+    } catch { toast("Couldn't reach the Pi."); }
+  }
+
   let checking = false;
   async function checkStatus() {
     if (checking || controller) return;
     checking = true;
     if (status !== "online") setStatus("checking", "Checking…");
     const r = await probe();
-    setStatus(r.state, r.text);
+    if (!waking) setStatus(r.state, r.text);
     updateTitle();
     if ($("#modelSheet").classList.contains("open")) renderModels();
     checking = false;
@@ -429,11 +500,14 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
 
   function pickModel() {
     if (settings.model) return settings.model;
-    const loaded = models.find(m => m.loaded);
-    return (loaded || models[0] || {}).id;
+    const pc = models.filter(m => !m.pi);
+    const loaded = pc.find(m => m.loaded);
+    if (loaded || pc[0]) return (loaded || pc[0]).id;
+    if (gw && !(gw.pc === "awake" && gw.lm)) return undefined;   // PC asleep: wake it, pick after
+    return (models[0] || {}).id;
   }
   const modelInfo = id => models.find(m => m.id === id);
-  const shortModel = id => id ? id.split("/").pop() : "Home AI";
+  const shortModel = id => id ? id.replace(/^pi:/, "").split("/").pop() : "Home AI";
   function updateTitle() {
     const id = pickModel();
     els.title.textContent = id ? shortModel(id) : "Home AI";
@@ -456,15 +530,15 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
       const pick = document.createElement("button");
       pick.className = "pick";
       pick.innerHTML = '<span class="tick">' + (m.id === sel ? "✓" : "") + '</span><span class="mn"><b>' + esc(m.name || shortModel(m.id)) + "</b><small>" + esc(sub) + "</small>" +
-        '<span class="badges">' + (modelsDetailed && m.loaded ? '<span class="badge on">Loaded</span>' : "") +
+        '<span class="badges">' + (m.pi ? '<span class="badge">Raspberry Pi</span>' : (modelsDetailed && m.loaded ? '<span class="badge on">Loaded</span>' : "")) +
         (m.vision ? '<span class="badge vis">Vision</span>' : "") + "</span></span>";
       pick.onclick = () => {
         settings.model = m.id; ls.set("settings", settings);
         updateTitle(); closeSheet("modelSheet");
-        toast(modelsDetailed && !m.loaded ? "Switched to " + shortModel(m.id) + ". It'll load when you send a message." : "Switched to " + shortModel(m.id));
+        toast(m.pi ? "Switched to " + shortModel(m.id) + " on the Pi (works even when the PC sleeps)." : modelsDetailed && !m.loaded ? "Switched to " + shortModel(m.id) + ". It'll load when you send a message." : "Switched to " + shortModel(m.id));
       };
       row.appendChild(pick);
-      if (canManage) {
+      if (canManage && !m.pi) {
         const act = document.createElement("button");
         act.className = "act" + (m.loaded ? "" : " load");
         act.textContent = busyModel === m.id ? (m.loaded ? "Unloading…" : "Loading…") : (m.loaded ? "Unload" : "Load");
@@ -551,7 +625,8 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
   function fillAssistant(bubble, m, live) {
     const p = parts(m);
     let html = "";
-    if (live && !p.r && !p.c) html += '<div class="loading-note">' + (m.loadingHint ? "Loading " + esc(shortModel(m.model)) + " on your PC…" : "") + "</div>";
+    if (m.note) html += '<div class="loading-note" style="margin-bottom:8px">' + esc(m.note) + "</div>";
+    if (live && !p.r && !p.c) html += '<div class="loading-note">' + (m.waking ? "Waking your PC… (about 10–30 seconds)" : m.loadingHint ? "Loading " + esc(shortModel(m.model)) + " on your PC…" : "") + "</div>";
     if (p.r) {
       const thinking = live && !p.c;
       html += '<details class="think"' + (thinking ? " open" : "") + "><summary>" + (thinking ? "Thinking…" : "Thought process") +
@@ -723,6 +798,7 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
   function friendly(detail, res) {
     if (res) {
       if (res.status === 401 || res.status === 403) return "Your PC rejected the token. Check it in Settings.";
+      if (detail && (res.status === 503 || res.status === 504)) return detail;
       if (res.status === 502 || res.status === 503) return "Your PC is on, but LM Studio's server isn't running. Flip the Status toggle in LM Studio.";
       return "Error " + res.status + (detail ? ": " + detail : "");
     }
@@ -753,9 +829,11 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
 
   async function run(chat) {
     stopSpeaking();
-    const model = pickModel();
+    let model = pickModel();
     const info = modelInfo(model);
-    const msg = { role: "assistant", content: "", reasoning: "", model, loadingHint: !!(modelsDetailed && info && !info.loaded) };
+    const needsWake = !!(gw && !(model || "").startsWith("pi:") && !(gw.pc === "awake" && gw.lm));
+    const msg = { role: "assistant", content: "", reasoning: "", model, waking: needsWake,
+                  loadingHint: !!(modelsDetailed && info && !info.loaded && !info.pi) };
     chat.messages.push(msg);
     chat.updated = Date.now();
     controller = new AbortController();
@@ -763,18 +841,34 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
     render();
     const bubble = els.messages.lastElementChild.querySelector(".bubble");
 
-    const body = { messages: (settings.system.trim() ? [{ role: "system", content: settings.system.trim() }] : []).concat(buildHistory(chat)), stream: true };
-    if (model) body.model = model;
-
     let frame = 0;
     const paint = () => { frame = 0; fillAssistant(bubble, msg, true); scrollBottom(); };
     try {
+      if (needsWake) {
+        const ok = await wakePc(controller.signal);
+        msg.waking = false;
+        if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");
+        if (ok) {
+          const r = await probe();
+          setStatus(r.state, r.text);
+          updateTitle();
+          if (!model) { model = pickModel(); msg.model = model; }
+        } else if (gw && gw.fallback && piModels.length) {
+          model = piModels[0].id; msg.model = model; msg.loadingHint = false;
+          msg.note = "Your PC didn't wake up, so the Pi answered with " + shortModel(model) + ".";
+        } else {
+          throw Object.assign(new Error("wake"), { wakeFailed: true });
+        }
+        paint();
+      }
+      const body = { messages: (settings.system.trim() ? [{ role: "system", content: settings.system.trim() }] : []).concat(buildHistory(chat)), stream: true };
+      if (model) body.model = model;
       const res = await fetch(base() + "/v1/chat/completions", { method: "POST", headers: headers(), body: JSON.stringify(body), signal: controller.signal });
       if (!res.ok) {
         let detail = ""; try { const j = await res.json(); detail = (j.error && (j.error.message || j.error)) || ""; } catch {}
         msg.error = friendly(typeof detail === "string" ? detail : "", res);
       } else {
-        setStatus("online", "PC online");
+        setStatus("online", gw ? "PC awake" : "PC online");
         if (info) info.loaded = true;
         const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "";
         for (;;) {
@@ -800,10 +894,11 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
       }
     } catch (e) {
       if (e.name === "AbortError") msg.stopped = true;
+      else if (e.wakeFailed) { msg.error = "Your PC didn't wake up. Check it's plugged in and not fully shut down."; checkStatus(); }
       else { msg.error = friendly(); setStatus("offline", "PC offline"); }
     } finally {
       if (frame) cancelAnimationFrame(frame);
-      delete msg.loadingHint;
+      delete msg.loadingHint; delete msg.waking;
       controller = null;
       chat.updated = Date.now();
       save(); setSending(false); render(); updateTitle();
@@ -891,7 +986,21 @@ body.drawer-open #scrim{opacity:1;pointer-events:auto}
     return { url, token: $("#sToken").value.trim(), system: $("#sSystem").value, autoSpeak: $("#sAutoSpeak").checked };
   }
   $("#settingsBtn").onclick = openSettings;
-  els.pill.onclick = () => { if (!settings.token) openSettings(); else checkStatus(); };
+  els.pill.onclick = async () => {
+    if (!settings.token && !gw) { openSettings(); return; }
+    if (gw && gw.pc === "asleep" && !waking) {
+      toast("Waking your PC…");
+      const ok = await wakePc();
+      toast(ok ? "Your PC is awake ✓" : "Your PC didn't wake up.");
+      checkStatus();
+      return;
+    }
+    if (gw && gw.pc === "awake" && !controller && !waking) {
+      if (confirm("Put your PC to sleep?")) sleepPc();
+      return;
+    }
+    checkStatus();
+  };
   $("#testBtn").onclick = async () => {
     const out = $("#testOut");
     const prev = settings; settings = Object.assign({}, settings, readForm());
