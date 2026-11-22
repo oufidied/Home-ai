@@ -1,7 +1,7 @@
 /* Home AI v2 — app */
 (() => {
 "use strict";
-const VERSION = "2.1.0";
+const VERSION = "2.2.0";
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -780,6 +780,14 @@ function renderPC() {
   else if (!acts.length) $("#shortcuts").innerHTML = `<div class="card faint small">${s.pc.agent ? "No shortcuts yet. Add them in C:\\HomeAI\\actions.json on your PC." : "Shortcuts show up here once the PC helper has connected (wake the PC once)."}</div>`;
   else $("#shortcuts").innerHTML = `<div class="shortcuts">${acts.map(a => `<button class="shortcut ${st.busyAction === a.id ? "busy" : ""}" data-action="${esc(a.id)}"><span class="ic">${esc(a.icon || "▶️")}</span><b>${esc(a.name)}</b><small>${esc(a.description || "")}</small></button>`).join("")}</div>`;
 
+  // open apps
+  const apps = s.pc.apps || [];
+  $("#appsNote").textContent = apps.length ? apps.length + " open" : "";
+  $("#appsCard").innerHTML = !s.pc.agent ? `<div class="faint small">${i.cls === "awake" ? "Waiting for the PC helper…" : "Shows what's open while the PC is awake."}</div>`
+    : !apps.length ? `<div class="faint small">No apps open.</div>`
+    : apps.map(a => `<div class="mrow"><span class="appic">${appIcon(a)}</span><div class="mn"><b>${esc(a.name)}</b><small class="title">${esc(a.title)}</small></div>
+        <button class="btn sm" data-app-close="${esc(a.pid)}">Close</button></div>`).join("");
+
   // stats
   const mt = s.pc.metrics;
   if (!mt) $("#stats").innerHTML = `<div class="card faint small">${i.cls === "awake" ? "Waiting for the PC helper…" : "Live stats appear while the PC is awake."}</div>`;
@@ -824,6 +832,11 @@ function renderPC() {
   const res = s.results || [];
   $("#resultsCard").innerHTML = res.length ? res.map(r => `<div class="r"><span class="${r.ok ? "ok" : "bad"}">${r.ok ? "✓" : "✕"}</span><span>${esc(r.name)}${r.message ? ` <span class="faint">${esc(r.message)}</span>` : ""}</span><span class="tm">${ago(r.at)}</span></div>`).join("") : `<div class="faint small">Nothing yet.</div>`;
 }
+const APP_ICONS = { robloxstudiobeta: "🧱", robloxplayerbeta: "🎮", claude: "✳️", chrome: "🌐", msedge: "🌐", firefox: "🦊", opera: "🌐", brave: "🦁",
+  code: "🧑‍💻", explorer: "📁", spotify: "🎵", discord: "💬", steam: "🎮", "lm studio": "🧠", windowsterminal: "⌨️", powershell: "⌨️", cmd: "⌨️",
+  notepad: "📝", whatsapp: "💬", obs64: "🎥", photoshop: "🎨", "adobe premiere pro": "🎬", arduino: "🔌", "arduino ide": "🔌", blender: "🧊", vlc: "🎞️" };
+function appIcon(a) { return APP_ICONS[(a.proc || "").toLowerCase()] || APP_ICONS[(a.name || "").toLowerCase()] || "🪟"; }
+
 function spark(vals, lo, hi, hot) {
   const v = vals.filter(x => x != null);
   if (v.length < 3) return "";
@@ -846,6 +859,22 @@ $("#pcPage").addEventListener("click", async e => {
     } catch (er) { toast(er.message); }
     setTimeout(() => { st.busyAction = null; renderPC(); }, 3000);
     pollSoon(); return;
+  }
+  const ac = e.target.closest("[data-app-close]");
+  if (ac) {
+    const app = ((st.status && st.status.pc.apps) || []).find(a => String(a.pid) === ac.dataset.appClose);
+    if (!app) return;
+    openSheet(`<div class="grab"></div><h3>Close ${esc(app.name)}?</h3><p class="muted small" style="margin:-6px 0 12px">${esc(app.title)}</p>` +
+      opt("close", "👋", "Close", "Like clicking the X. If there's unsaved work, it may wait for you on the PC.") +
+      opt("force", "⛔", "Force close", "Closes it immediately. Unsaved work is lost.", false, "danger") +
+      `<button class="btn" data-close style="width:100%;margin-top:10px">Cancel</button>`,
+      async ev => {
+        const b = ev.target.closest("[data-opt]"); if (!b) return; closeSheet();
+        try { await api("/hub/pc/app/close", { method: "POST", body: { pid: app.pid, force: b.dataset.opt === "force" } }); toast(b.dataset.opt === "force" ? "Force-closing " + app.name : "Closing " + app.name); }
+        catch (er) { toast(er.message); }
+        setTimeout(pollSoon, 6000);
+      });
+    return;
   }
   const mo = e.target.closest("[data-model-op]");
   if (mo) {
@@ -1097,8 +1126,10 @@ async function renderSettings() {
     <div class="spread" style="margin-top:6px"><span class="muted">Pi hub</span><span>${st.status ? esc(st.status.hub) : "—"}</span></div>
     <div class="spread" style="margin-top:6px"><span class="muted">PC helper</span><span>${st.status && st.status.pc.agent_info && st.status.pc.agent_info.version ? esc(st.status.pc.agent_info.version) : "not connected"}</span></div>
     <div class="row" style="margin-top:14px"><button class="btn sm" id="reloadApp">Reload app</button><button class="btn sm danger" id="wipeAll">Delete all chats</button></div></div></div>`;
+  h += `<div class="section"><h2>Emergency shutdown</h2><div class="card" id="emergCard"><div class="faint small">Checking…</div></div></div>`;
   $("#settingsPage").innerHTML = h;
   renderNotif();
+  renderEmergency();
 }
 $("#settingsPage").addEventListener("change", e => {
   const t = e.target;
@@ -1130,6 +1161,14 @@ $("#settingsPage").addEventListener("click", async e => {
   if (t.id === "reloadApp") location.reload();
   if (t.id === "wipeAll") { if (confirm("Delete ALL chats on every device? This can't be undone.")) { await api("/hub/chats", { method: "DELETE" }).catch(er => toast(er.message)); newChat(); loadChats(); toast("All chats deleted"); } }
   if (t.id === "notifOn") enableNotifications();
+  if (t.id === "emGo") emergencySheet();
+  if (t.id === "emChange") renderEmergency(true);
+  if (t.id === "emSet") {
+    const n1 = $("#emNew").value, n2 = $("#emNew2").value;
+    if (n1 !== n2) { toast("The two passwords don't match"); return; }
+    try { await api("/hub/emergency/password", { method: "POST", body: { new: n1, current: $("#emCur") ? $("#emCur").value : "" } }); toast("Emergency password saved 🔒"); renderEmergency(); }
+    catch (er) { toast(er.message); }
+  }
   if (t.id === "notifTest") {
     try {
       const r = await api("/hub/push/test", { method: "POST", timeout: 30000 });
@@ -1138,6 +1177,51 @@ $("#settingsPage").addEventListener("click", async e => {
     } catch (er) { toast(er.message, 5000); }
   }
 });
+
+/* ------------------------------------------------------------------ emergency shutdown */
+async function renderEmergency(showChange) {
+  const box = $("#emergCard"); if (!box) return;
+  let e;
+  try { e = await api("/hub/emergency"); } catch { box.innerHTML = `<div class="faint small">Can't reach the Pi.</div>`; return; }
+  if (!e.set) {
+    box.innerHTML = `<p class="small muted" style="margin:0 0 12px">Shuts down your PC and your Raspberry Pi in one go. Set a password first so nobody can do it by accident.</p>
+      <div class="field"><label for="emNew">New password</label><input id="emNew" class="input" type="password" autocomplete="new-password"></div>
+      <div class="field"><label for="emNew2">Type it again</label><input id="emNew2" class="input" type="password" autocomplete="new-password"></div>
+      <button class="btn sm" id="emSet">Set password</button>`;
+    return;
+  }
+  box.innerHTML = `<p class="small muted" style="margin:0 0 12px">Shuts down your PC right away, then the Raspberry Pi. Needs your emergency password.</p>
+    <button class="btn red" id="emGo" style="width:100%">Emergency shutdown</button>
+    <div style="margin-top:12px">${showChange ? `
+      <div class="field"><label for="emCur">Current password</label><input id="emCur" class="input" type="password" autocomplete="current-password"></div>
+      <div class="field"><label for="emNew">New password</label><input id="emNew" class="input" type="password" autocomplete="new-password"></div>
+      <div class="field"><label for="emNew2">Type it again</label><input id="emNew2" class="input" type="password" autocomplete="new-password"></div>
+      <button class="btn sm" id="emSet">Change password</button>
+      <p class="hint">Forgot it? On the Pi run: <code>touch ~/home-ai-gateway/reset-password && sudo systemctl restart home-ai-gateway</code></p>`
+      : `<button class="linkbtn" id="emChange">Change password</button>`}</div>`;
+}
+function emergencySheet() {
+  const h = `<div class="grab"></div><h3>Emergency shutdown</h3>
+    <div class="emerg-warn">Your PC shuts down <b>immediately</b>: unsaved work is lost (Roblox keeps what Team Create auto-saved).
+      Then the Raspberry Pi turns off. <b>To bring the Pi back you'll have to unplug it and plug it back in.</b> Until then this app, waking the PC and your home devices won't work.</div>
+    <div class="toggle-row"><div class="tx"><b>Shut down the PC</b></div><label class="switch"><input type="checkbox" id="emPc" checked><span></span></label></div>
+    <div class="toggle-row"><div class="tx"><b>Shut down the Raspberry Pi</b></div><label class="switch"><input type="checkbox" id="emPi" checked><span></span></label></div>
+    <div class="field" style="margin-top:10px"><label for="emPw">Emergency password</label><input id="emPw" class="input" type="password" autocomplete="current-password"></div>
+    <button class="btn red" id="emConfirm" style="width:100%">Shut it all down</button>
+    <button class="btn" data-close style="width:100%;margin-top:8px">Cancel</button>`;
+  openSheet(h, async e => {
+    const b = e.target.closest("#emConfirm"); if (!b) return;
+    const pc = $("#emPc").checked, pi = $("#emPi").checked;
+    if (!pc && !pi) { toast("Pick at least one"); return; }
+    b.disabled = true; b.textContent = "Shutting down…";
+    try {
+      const r = await api("/hub/emergency", { method: "POST", body: { password: $("#emPw").value, pc, pi } });
+      closeSheet();
+      toast([r.pc ? "PC: " + r.pc : "", r.pi ? "Pi: " + r.pi : ""].filter(Boolean).join(". ") + ". Bye 👋", 7000);
+    } catch (er) { b.disabled = false; b.textContent = "Shut it all down"; toast(er.message, 4500); }
+  });
+  setTimeout(() => $("#emPw") && $("#emPw").focus(), 100);
+}
 
 /* ------------------------------------------------------------------ notifications */
 let swReg = null;

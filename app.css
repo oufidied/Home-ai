@@ -456,3 +456,10 @@ body.drawer-open #scrim { opacity: 1; pointer-events: auto; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }
+
+/* open apps + emergency */
+.appic { width: 34px; height: 34px; border-radius: 10px; background: var(--raised); display: grid; place-items: center; font-size: 17px; flex: none; }
+.mrow .mn small.title { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.btn.red { background: var(--coral); border: 0; color: #fff; font-weight: 600; }
+.emerg-warn { border: 1px solid rgba(255, 107, 122, .35); background: rgba(255, 107, 122, .07); border-radius: 12px; padding: 12px; font-size: 13.5px; color: #FFC2C9; line-height: 1.45; margin-bottom: 14px; }
+.linkbtn { color: var(--blue); font-size: 13.5px; }
